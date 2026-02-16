@@ -1,0 +1,35 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SefSheet
+        uses: actions/checkout@v4
+
+      - name: Checkout Pages repo
+        uses: actions/checkout@v4
+        with:
+          repository: sefk/sefk.github.io
+          token: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+          path: pages-repo
+
+      - name: Copy SefSheet files
+        run: |
+          mkdir -p pages-repo/sefsheet
+          cp index.html styles.css app.js pages-repo/sefsheet/
+
+      - name: Deploy
+        run: |
+          cd pages-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sefsheet/
+          git diff --cached --quiet && echo "No changes to deploy" && exit 0
+          git commit -m "Deploy SefSheet from ${{ github.sha }}"
+          git push
