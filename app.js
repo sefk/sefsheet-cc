@@ -14,6 +14,17 @@ let cellRDeps = {};   // cellRDeps["B1"] = Set(["A1"]) means if B1 changes, reca
 let currentSelection = null;  // { type: 'cell'|'row'|'col'|'all', cells: Set, anchor: string }
 let editingCellId = null;
 
+// Column widths and row heights (indexed by col/row number)
+let colWidths = {};   // colWidths[0] = 80  (col A)
+let rowHeights = {};  // rowHeights[0] = 24 (row 1)
+const DEFAULT_COL_WIDTH = 80;
+const DEFAULT_ROW_HEIGHT = 24;
+const MIN_COL_WIDTH = 30;
+const MIN_ROW_HEIGHT = 14;
+
+// Resize state
+let resizing = null; // { type: 'col'|'row', index, startX/startY, startSize }
+
 // ─── DOM References ──────────────────────────────────────────────────────────
 const gridHead = document.getElementById('grid-head');
 const gridBody = document.getElementById('grid-body');
@@ -71,7 +82,19 @@ function buildGrid() {
     const th = document.createElement('th');
     th.textContent = colToLetter(c);
     th.dataset.col = c;
-    th.addEventListener('click', () => selectColumn(c));
+    th.addEventListener('click', (e) => {
+      if (!resizing) selectColumn(c);
+    });
+
+    // Column resize handle
+    const colHandle = document.createElement('div');
+    colHandle.classList.add('col-resize-handle');
+    colHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startColResize(c, e);
+    });
+    th.appendChild(colHandle);
+
     headerRow.appendChild(th);
   }
   gridHead.appendChild(headerRow);
@@ -82,7 +105,20 @@ function buildGrid() {
     const rowHeader = document.createElement('td');
     rowHeader.textContent = r + 1;
     rowHeader.dataset.row = r;
-    rowHeader.addEventListener('click', () => selectRow(r));
+    rowHeader.style.position = 'relative';
+    rowHeader.addEventListener('click', (e) => {
+      if (!resizing) selectRow(r);
+    });
+
+    // Row resize handle
+    const rowHandle = document.createElement('div');
+    rowHandle.classList.add('row-resize-handle');
+    rowHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startRowResize(r, e);
+    });
+    rowHeader.appendChild(rowHandle);
+
     tr.appendChild(rowHeader);
 
     for (let c = 0; c < NUM_COLS; c++) {
@@ -620,21 +656,28 @@ function expandRange(fromId, toId, refs, contextId) {
       const id = cellId(r, c);
       if (id === contextId) throw new Error('#CIRCULAR!');
       refs.add(id);
-      const val = getCellNumericValue(id);
-      if (val !== '') values.push(val);
+      const val = getCellRawValue(id);
+      if (val !== null) values.push(val);
     }
   }
   return values;
 }
 
-function getCellNumericValue(id) {
+// Returns null for blank cells, allowing callers to distinguish blank from 0
+function getCellRawValue(id) {
   const data = cellData[id];
-  if (!data || data.raw === '') return 0;
+  if (!data || data.raw === '') return null;
   if (data.error) throw new Error('#REF!');
   const v = data.value;
-  if (v === '' || v === undefined || v === null) return 0;
+  if (v === '' || v === undefined || v === null) return null;
   const num = Number(v);
   return isNaN(num) ? v : num;
+}
+
+// For direct cell references in arithmetic: blank → 0
+function getCellNumericValue(id) {
+  const val = getCellRawValue(id);
+  return val === null ? 0 : val;
 }
 
 function callFunction(name, args) {
@@ -705,8 +748,10 @@ function saveToStorage() {
       toSave[id] = { raw: d.raw, formatting: d.formatting };
     }
   }
+  // Include col/row sizes
+  const payload = { cells: toSave, colWidths, rowHeights };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch (e) {
     console.warn('Failed to save to localStorage:', e);
   }
@@ -717,15 +762,23 @@ function loadFromStorage() {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (!saved) return;
     const parsed = JSON.parse(saved);
-    for (const id in parsed) {
-      const d = parsed[id];
-      cellData[id] = {
-        raw: d.raw || '',
-        value: '',
-        formula: (d.raw || '').startsWith('='),
-        formatting: d.formatting || {}
-      };
+
+    // Support both old format (flat cells) and new format (with sizes)
+    const cells = parsed.cells || parsed;
+    for (const id in cells) {
+      const d = cells[id];
+      if (d && typeof d === 'object' && 'raw' in d) {
+        cellData[id] = {
+          raw: d.raw || '',
+          value: '',
+          formula: (d.raw || '').startsWith('='),
+          formatting: d.formatting || {}
+        };
+      }
     }
+
+    if (parsed.colWidths) colWidths = parsed.colWidths;
+    if (parsed.rowHeights) rowHeights = parsed.rowHeights;
   } catch (e) {
     console.warn('Failed to load from localStorage:', e);
   }
@@ -878,10 +931,142 @@ function deleteSelectedCells() {
   saveToStorage();
 }
 
+// ─── Column & Row Resizing ───────────────────────────────────────────────────
+function getColWidth(c) {
+  return colWidths[c] !== undefined ? colWidths[c] : DEFAULT_COL_WIDTH;
+}
+
+function getRowHeight(r) {
+  return rowHeights[r] !== undefined ? rowHeights[r] : DEFAULT_ROW_HEIGHT;
+}
+
+function setColWidth(c, width) {
+  width = Math.max(MIN_COL_WIDTH, Math.round(width));
+  colWidths[c] = width;
+
+  const px = width + 'px';
+
+  // Update the header <th>
+  const th = gridHead.querySelector(`th[data-col="${c}"]`);
+  if (th) {
+    th.style.width = px;
+    th.style.minWidth = px;
+    th.style.maxWidth = px;
+  }
+
+  // Update all cells in this column
+  const cells = gridBody.querySelectorAll(`td[data-col="${c}"]`);
+  cells.forEach(td => {
+    td.style.width = px;
+    td.style.minWidth = px;
+    td.style.maxWidth = px;
+  });
+}
+
+function setRowHeight(r, height) {
+  height = Math.max(MIN_ROW_HEIGHT, Math.round(height));
+  rowHeights[r] = height;
+
+  // Update all cells in this row (including the row header)
+  const row = gridBody.children[r];
+  if (!row) return;
+  for (const td of row.children) {
+    td.style.height = height + 'px';
+  }
+}
+
+function applyAllSizes() {
+  for (const c in colWidths) {
+    setColWidth(Number(c), colWidths[c]);
+  }
+  for (const r in rowHeights) {
+    setRowHeight(Number(r), rowHeights[r]);
+  }
+}
+
+function startColResize(colIndex, e) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = getColWidth(colIndex);
+  resizing = { type: 'col', index: colIndex, startX, startSize: startWidth };
+  document.body.classList.add('resizing-col');
+
+  // Create guide line
+  const guide = document.createElement('div');
+  guide.classList.add('resize-guide', 'col-guide');
+  guide.id = 'resize-guide';
+  const container = document.getElementById('grid-container');
+  guide.style.left = (e.clientX - container.getBoundingClientRect().left + container.scrollLeft) + 'px';
+  container.appendChild(guide);
+
+  function onMouseMove(e) {
+    const dx = e.clientX - startX;
+    const newWidth = Math.max(MIN_COL_WIDTH, startWidth + dx);
+    guide.style.left = (e.clientX - container.getBoundingClientRect().left + container.scrollLeft) + 'px';
+    // Live preview
+    setColWidth(colIndex, newWidth);
+  }
+
+  function onMouseUp(e) {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+    document.body.classList.remove('resizing-col');
+    guide.remove();
+
+    const dx = e.clientX - startX;
+    setColWidth(colIndex, startWidth + dx);
+    saveToStorage();
+    setTimeout(() => { resizing = null; }, 0);
+  }
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+}
+
+function startRowResize(rowIndex, e) {
+  e.preventDefault();
+  const startY = e.clientY;
+  const startHeight = getRowHeight(rowIndex);
+  resizing = { type: 'row', index: rowIndex, startY, startSize: startHeight };
+  document.body.classList.add('resizing-row');
+
+  // Create guide line
+  const guide = document.createElement('div');
+  guide.classList.add('resize-guide', 'row-guide');
+  guide.id = 'resize-guide';
+  const container = document.getElementById('grid-container');
+  guide.style.top = (e.clientY - container.getBoundingClientRect().top + container.scrollTop) + 'px';
+  container.appendChild(guide);
+
+  function onMouseMove(e) {
+    const dy = e.clientY - startY;
+    const newHeight = Math.max(MIN_ROW_HEIGHT, startHeight + dy);
+    guide.style.top = (e.clientY - container.getBoundingClientRect().top + container.scrollTop) + 'px';
+    // Live preview
+    setRowHeight(rowIndex, newHeight);
+  }
+
+  function onMouseUp(e) {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+    document.body.classList.remove('resizing-row');
+    guide.remove();
+
+    const dy = e.clientY - startY;
+    setRowHeight(rowIndex, startHeight + dy);
+    saveToStorage();
+    setTimeout(() => { resizing = null; }, 0);
+  }
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+}
+
 // ─── Initialize ──────────────────────────────────────────────────────────────
 function init() {
   buildGrid();
   loadFromStorage();
+  applyAllSizes();
   recalcAll();
   renderAllCells();
   setupEventListeners();

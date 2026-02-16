@@ -7,6 +7,6 @@
 - Cell borders
 - Copy / paste
 - Undo / redo
-- Resizable column widths / row heights
+- ~~Resizable column widths / row heights~~ (done)
 - Dynamic grid expansion (add rows / columns)
 - Multiple sheets / tabs
